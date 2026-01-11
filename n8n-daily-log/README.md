@@ -1,4 +1,4 @@
-# Hello n8n – Daily Log
+# Hello N8N – Daily Log
 
 ## Description
 A simple scheduled n8n workflow that:
