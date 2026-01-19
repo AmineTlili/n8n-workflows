@@ -1,0 +1,363 @@
+{
+  "name": "Job Tracker (URL -> Excel) + Email Status Updates",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "job-applied",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "Webhook",
+      "name": "Webhook (Job URL)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-900, -160]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body || $json;\n// Expect: { url: \"https://...\" }\nif (!body.url) throw new Error('Missing body.url');\nreturn [{\n  url: String(body.url).trim(),\n  appliedAt: new Date().toISOString()\n}];"
+      },
+      "id": "NormalizeInput",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-680, -160]
+    },
+    {
+      "parameters": {
+        "url": "={{$json.url}}",
+        "options": {
+          "followRedirect": true,
+          "timeout": 60000,
+          "response": {
+            "responseFormat": "string"
+          }
+        }
+      },
+      "id": "FetchJobPage",
+      "name": "HTTP Request (Fetch Job Page)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [-450, -160]
+    },
+    {
+      "parameters": {
+        "jsCode": "function stripHtml(html){\n  return html\n    .replace(/<script[\\s\\S]*?<\\/script>/gi,' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi,' ')\n    .replace(/<noscript[\\s\\S]*?<\\/noscript>/gi,' ')\n    .replace(/<[^>]+>/g,' ')\n    .replace(/\\s+/g,' ')\n    .trim();\n}\n\nconst html = $json.body || '';\nconst text = stripHtml(html);\n// Keep a safe chunk for the LLM\nconst chunk = text.slice(0, 12000);\n\nreturn [{\n  url: $items('Normalize Input')[0].json.url,\n  appliedAt: $items('Normalize Input')[0].json.appliedAt,\n  pageText: chunk\n}];"
+      },
+      "id": "CleanText",
+      "name": "Clean HTML -> Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-220, -160]
+    },
+    {
+      "parameters": {
+        "operation": "chat",
+        "model": "gpt-4o-mini",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You extract structured job application info. Return ONLY valid JSON with keys: company, job_title, location, contract_type, seniority, source_site, description_short, technologies, salary, apply_url. If unknown use null. technologies must be array of strings."
+          },
+          {
+            "role": "user",
+            "content": "Job URL: {{$json.url}}\n\nPage text:\n{{$json.pageText}}"
+          }
+        ],
+        "options": {
+          "temperature": 0.1,
+          "maxTokens": 700
+        }
+      },
+      "id": "LLMExtract",
+      "name": "LLM (Extract Job Infos)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 4,
+      "position": [20, -160],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_WITH_YOUR_OPENAI_CRED_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "let data;\ntry {\n  // OpenAI node returns text in different places depending on n8n version\n  const raw = $json.choices?.[0]?.message?.content ?? $json.text ?? $json.message?.content ?? '';\n  data = JSON.parse(raw);\n} catch (e) {\n  throw new Error('LLM output was not valid JSON');\n}\n\nconst row = {\n  job_id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,\n  applied_at: $items('Clean HTML -> Text')[0].json.appliedAt,\n  status: 'Applied',\n  last_email_update: null,\n  url: $items('Clean HTML -> Text')[0].json.url,\n  company: data.company ?? null,\n  job_title: data.job_title ?? null,\n  location: data.location ?? null,\n  contract_type: data.contract_type ?? null,\n  seniority: data.seniority ?? null,\n  source_site: data.source_site ?? null,\n  description_short: data.description_short ?? null,\n  technologies: Array.isArray(data.technologies) ? data.technologies.join(', ') : null,\n  salary: data.salary ?? null,\n  apply_url: data.apply_url ?? $items('Clean HTML -> Text')[0].json.url\n};\n\nreturn [row];"
+      },
+      "id": "BuildRow",
+      "name": "Build Excel Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, -160]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "filePath": "/data/job_tracker/jobs.xlsx",
+        "options": {}
+      },
+      "id": "ReadExcel",
+      "name": "Spreadsheet File (Read XLSX)",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 1,
+      "position": [500, -160]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = '/data/job_tracker/jobs.xlsx';\n\n// Existing rows from Read node (if file exists). If file missing, n8n may error.\n// To keep it simple: create empty if missing by catching in n8n settings OR create it once manually.\n\nconst newRow = $items('Build Excel Row')[0].json;\n\n// n8n SpreadsheetFile read returns items each representing a row.\nconst existingRows = $items('Spreadsheet File (Read XLSX)')?.map(i => i.json) ?? [];\n\n// Dedup rule: same URL OR same (company + job_title) if URL is missing\nconst norm = (s) => (s ?? '').toString().trim().toLowerCase();\nconst exists = existingRows.some(r => {\n  const sameUrl = norm(r.url) && norm(r.url) === norm(newRow.url);\n  const samePair = norm(r.company) && norm(r.job_title) && norm(r.company) === norm(newRow.company) && norm(r.job_title) === norm(newRow.job_title);\n  return sameUrl || samePair;\n});\n\nlet finalRows;\nif (exists) {\n  finalRows = existingRows.map(r => {\n    const sameUrl = norm(r.url) && norm(r.url) === norm(newRow.url);\n    const samePair = norm(r.company) && norm(r.job_title) && norm(r.company) === norm(newRow.company) && norm(r.job_title) === norm(newRow.job_title);\n    if (sameUrl || samePair) {\n      return {\n        ...r,\n        // keep existing status, but fill missing details\n        company: r.company || newRow.company,\n        job_title: r.job_title || newRow.job_title,\n        location: r.location || newRow.location,\n        contract_type: r.contract_type || newRow.contract_type,\n        seniority: r.seniority || newRow.seniority,\n        source_site: r.source_site || newRow.source_site,\n        description_short: r.description_short || newRow.description_short,\n        technologies: r.technologies || newRow.technologies,\n        salary: r.salary || newRow.salary,\n        apply_url: r.apply_url || newRow.apply_url,\n        url: r.url || newRow.url\n      };\n    }\n    return r;\n  });\n} else {\n  finalRows = [...existingRows, newRow];\n}\n\nreturn finalRows.map(r => ({ json: r }));"
+      },
+      "id": "UpsertRow",
+      "name": "Upsert Row In Memory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, -160]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "filePath": "/data/job_tracker/jobs.xlsx",
+        "options": {
+          "headerRow": true
+        }
+      },
+      "id": "WriteExcel",
+      "name": "Spreadsheet File (Write XLSX)",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 1,
+      "position": [980, -160]
+    },
+    {
+      "parameters": {
+        "responseBody": "={{$json}}",
+        "options": {}
+      },
+      "id": "WebhookResponse",
+      "name": "Return JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1210, -160]
+    },
+
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "Cron",
+      "name": "Cron (Every 6 hours)",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [-900, 220]
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "options": {},
+        "searchCriteria": "UNSEEN"
+      },
+      "id": "IMAP",
+      "name": "IMAP Email (UNSEEN)",
+      "type": "n8n-nodes-base.imap",
+      "typeVersion": 1,
+      "position": [-680, 220],
+      "credentials": {
+        "imap": {
+          "id": "REPLACE_WITH_YOUR_IMAP_CRED_ID",
+          "name": "IMAP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "filePath": "/data/job_tracker/jobs.xlsx",
+        "options": {}
+      },
+      "id": "ReadExcel2",
+      "name": "Spreadsheet File (Read XLSX) [for update]",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 1,
+      "position": [-450, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "const emails = $items('IMAP Email (UNSEEN)').map(i => i.json);\nconst rows = $items('Spreadsheet File (Read XLSX) [for update]').map(i => i.json);\n\nconst norm = (s) => (s ?? '').toString().toLowerCase();\n\nfunction inferStatus(subject, text){\n  const s = norm(subject + ' ' + text);\n  // Keep it simple; you can add more keywords\n  if (/(rejected|unfortunately|not selected|declined|we will not proceed|refus)/i.test(s)) return 'Rejected';\n  if (/(interview|entretien|call|screening|technical|test|assessment|meet)/i.test(s)) return 'Interview';\n  if (/(offer|proposition|congratulations|we are pleased)/i.test(s)) return 'Offer';\n  return null;\n}\n\nfunction matchRow(email, row){\n  // Matching rule: company OR job title appears in email subject/body\n  const subject = norm(email.subject);\n  const body = norm(email.text || email.html || '');\n  const hay = subject + ' ' + body;\n  const company = norm(row.company);\n  const title = norm(row.job_title);\n  const url = norm(row.url);\n\n  // If url domain appears in email, strong match\n  const domainMatch = url && hay.includes(url.replace(/^https?:\\/\\//,'').split('/')[0]);\n  const companyMatch = company && hay.includes(company);\n  const titleMatch = title && hay.includes(title);\n\n  return domainMatch || (companyMatch && titleMatch) || companyMatch;\n}\n\nlet updated = rows;\n\nfor (const email of emails){\n  const newStatus = inferStatus(email.subject, email.text || email.html || '');\n  if (!newStatus) continue;\n\n  updated = updated.map(r => {\n    if (!r) return r;\n    if (matchRow(email, r)) {\n      // Only upgrade if meaningful\n      const old = r.status || 'Applied';\n      const priority = { Applied: 1, Interview: 2, Offer: 3, Rejected: 0 };\n      const shouldReplace = (priority[newStatus] ?? 0) >= (priority[old] ?? 0);\n      return {\n        ...r,\n        status: shouldReplace ? newStatus : old,\n        last_email_update: new Date().toISOString()\n      };\n    }\n    return r;\n  });\n}\n\nreturn updated.map(r => ({ json: r }));"
+      },
+      "id": "UpdateStatuses",
+      "name": "Update Statuses From Emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-220, 220]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "filePath": "/data/job_tracker/jobs.xlsx",
+        "options": {
+          "headerRow": true
+        }
+      },
+      "id": "WriteExcel2",
+      "name": "Spreadsheet File (Write XLSX) [updated]",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 1,
+      "position": [20, 220]
+    }
+  ],
+  "connections": {
+    "Webhook (Job URL)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request (Fetch Job Page)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request (Fetch Job Page)": {
+      "main": [
+        [
+          {
+            "node": "Clean HTML -> Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean HTML -> Text": {
+      "main": [
+        [
+          {
+            "node": "LLM (Extract Job Infos)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM (Extract Job Infos)": {
+      "main": [
+        [
+          {
+            "node": "Build Excel Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Excel Row": {
+      "main": [
+        [
+          {
+            "node": "Spreadsheet File (Read XLSX)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Spreadsheet File (Read XLSX)": {
+      "main": [
+        [
+          {
+            "node": "Upsert Row In Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Row In Memory": {
+      "main": [
+        [
+          {
+            "node": "Spreadsheet File (Write XLSX)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Spreadsheet File (Write XLSX)": {
+      "main": [
+        [
+          {
+            "node": "Return JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+
+    "Cron (Every 6 hours)": {
+      "main": [
+        [
+          {
+            "node": "IMAP Email (UNSEEN)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IMAP Email (UNSEEN)": {
+      "main": [
+        [
+          {
+            "node": "Spreadsheet File (Read XLSX) [for update]",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Spreadsheet File (Read XLSX) [for update]": {
+      "main": [
+        [
+          {
+            "node": "Update Statuses From Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Statuses From Emails": {
+      "main": [
+        [
+          {
+            "node": "Spreadsheet File (Write XLSX) [updated]",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "version": 1
+}
