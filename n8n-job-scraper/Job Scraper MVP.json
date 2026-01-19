@@ -2,12 +2,12 @@
   "name": "Job Scraper MVP",
   "nodes": [
     {
-      "parameters": {
+      "parameters": { 
         "documentId": {
           "__rl": true,
           "value": "={{\"1aO5t9wmd07pTc_U2NSXEuptbPs5CeIrFPkmz8jQcQI4\"}}",
           "mode": "url"
-        },
+        }, 
         "sheetName": {
           "__rl": true,
           "value": "gid=0",
